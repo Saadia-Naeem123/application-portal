@@ -155,7 +155,7 @@ function NewApplicationForm() {
     e.target.value = '';
   };
 
-  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
+  const handleDrop = (e: DragEvent<HTMLLabelElement>) => {
     e.preventDefault();
     setDragActive(false);
     if (e.dataTransfer.files) uploadFiles(e.dataTransfer.files);
