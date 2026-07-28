@@ -1,0 +1,579 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  STUDENT
+  FACULTY
+  STAFF
+  ACADEMIC_SUPERVISOR
+  DEPARTMENT_OFFICER
+  DEAN
+  ADMIN
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum ApplicationStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_SUPERVISOR_REVIEW
+  UNDER_DEPARTMENT_REVIEW
+  AWAITING_INFO
+  APPROVED
+  REJECTED
+  ESCALATED
+  CLOSED
+}
+
+enum HolidayType {
+  PUBLIC
+  UNIVERSITY
+  SPECIAL
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5/6 — Workflow, Routing, Deadline, Reminder & Escalation Engine
+// ---------------------------------------------------------------------------
+
+// Who currently "owns" an application, independent of its coarser
+// ApplicationStatus. SUPERVISOR/DEPARTMENT map to the existing
+// UNDER_SUPERVISOR_REVIEW/UNDER_DEPARTMENT_REVIEW statuses; the escalation
+// levels (DEPARTMENT_HEAD/DEAN/ADMIN) all surface as the existing ESCALATED
+// status, so the escalation hierarchy layers on top of Phase 4's statuses
+// instead of requiring a schema change to ApplicationStatus itself.
+enum WorkflowStage {
+  SUPERVISOR
+  DEPARTMENT
+  DEPARTMENT_HEAD
+  DEAN
+  ADMIN
+}
+
+// One row per meaningful thing that happened to an application — powers the
+// "Activity timeline" / "Workflow history" deliverables.
+enum WorkflowAction {
+  SUBMITTED
+  APPROVED
+  REJECTED
+  INFO_REQUESTED
+  INFO_PROVIDED
+  FORWARDED
+  ESCALATED
+  COMMENTED
+  REMINDER_SENT
+  CLOSED
+  // Dean Portal (Phase 10)
+  RETURNED_TO_DEPARTMENT
+  INVESTIGATION_REQUESTED
+}
+
+enum ReminderChannel {
+  EMAIL
+  IN_APP
+  SMS
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 — Communication & Notification System
+// ---------------------------------------------------------------------------
+
+// Same three channels as ReminderChannel, kept as a separate enum because it
+// describes a different concept (how a *notification* was delivered / may be
+// delivered, vs. how a reminder nudge specifically was sent) even though the
+// values are identical today.
+enum NotificationChannel {
+  EMAIL
+  IN_APP
+  SMS
+}
+
+model User {
+  id                  String    @id @default(uuid())
+  fullName            String
+  email               String    @unique
+  passwordHash        String
+  role                Role
+
+  registrationNumber  String?
+  employeeId          String?
+  department          String?
+  program             String?
+  semester             Int?
+  phoneNumber         String?
+
+  // Self relation: a student picks an active Academic Supervisor
+  supervisorId        String?
+  supervisor          User?     @relation("StudentSupervisor", fields: [supervisorId], references: [id])
+  students            User[]    @relation("StudentSupervisor")
+
+  isActiveSupervisor  Boolean   @default(false)
+  // Marks a DEPARTMENT_OFFICER as their department's head, i.e. the
+  // authorized reviewer for the DEPARTMENT_HEAD escalation stage. Same
+  // pattern as isActiveSupervisor: a fixed Role enum plus an admin-managed
+  // flag, rather than adding a role that only ever holds one extra bit.
+  isDepartmentHead    Boolean   @default(false)
+  isEmailVerified     Boolean   @default(false)
+  isActive            Boolean   @default(true)
+
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]
+  refreshTokens           RefreshToken[]
+
+  // Applications this user has submitted, and — when this user is an
+  // Academic Supervisor — applications routed to them for review.
+  applications            Application[] @relation("ApplicantApplications")
+  supervisedApplications  Application[] @relation("SupervisorApplications")
+  // Applications explicitly forwarded to this user (any stage).
+  assignedApplications    Application[] @relation("AssignedOfficerApplications")
+
+  workflowActions         ApplicationHistory[]
+  comments                ApplicationComment[]
+  remindersReceived       ApplicationReminder[]
+  notifications           Notification[]
+  escalationsHandedOff    EscalationRecord[] @relation("EscalationFrom")
+  escalationsReceived     EscalationRecord[] @relation("EscalationTo")
+  notificationPreference  NotificationPreference?
+  auditLogs               AuditLog[]
+
+  @@index([role])
+  @@index([supervisorId])
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Administration & Master Data Management
+// ---------------------------------------------------------------------------
+
+model Department {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  code        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  applicationTypes ApplicationType[]
+  applications     Application[]
+
+  @@index([isActive])
+}
+
+// One row per application category. `departmentId` + `requiresSupervisorApproval`
+// together ARE the routing rule for that category — the `/routing-rules` API
+// reads/writes those same two fields under a routing-focused name, per the
+// "Routing rule management" admin task, without duplicating the table.
+model ApplicationType {
+  id                         String   @id @default(uuid())
+  name                       String   @unique
+  code                       String   @unique
+  description                String?
+  departmentId               String
+  department                 Department @relation(fields: [departmentId], references: [id])
+  requiresSupervisorApproval Boolean  @default(false)
+  defaultPriority            Priority @default(MEDIUM)
+  slaWorkingHours            Int      @default(72)
+  isActive                   Boolean  @default(true)
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  applications Application[]
+
+  @@index([departmentId])
+  @@index([isActive])
+}
+
+// University calendar — single dates (public/university holidays, closures).
+model Holiday {
+  id        String      @id @default(uuid())
+  name      String
+  date      DateTime
+  type      HolidayType @default(UNIVERSITY)
+  createdAt DateTime    @default(now())
+
+  @@index([date])
+}
+
+// University calendar — date ranges (semester breaks), kept separate from
+// Holiday so admins can manage them with a start/end date instead of one row
+// per day, while both feed the same calendar dashboard.
+model SemesterBreak {
+  id        String   @id @default(uuid())
+  name      String
+  startDate DateTime
+  endDate   DateTime
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([startDate, endDate])
+}
+
+// Lightweight, admin-editable permission matrix layered on top of the fixed
+// Role enum — lets an admin fine-tune what each role can see/do per resource
+// (e.g. "DEPARTMENT_OFFICER" / "applications" -> canView, canEdit) without a
+// code change, while `requireRole` middleware continues to guard the coarse,
+// non-negotiable checks (e.g. only ADMIN can manage master data).
+model RolePermission {
+  id        String   @id @default(uuid())
+  role      Role
+  resource  String
+  canView   Boolean  @default(true)
+  canEdit   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([role, resource])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — Application Submission Module
+// ---------------------------------------------------------------------------
+
+model Application {
+  id                String            @id @default(uuid())
+  // Human-readable tracking ID, e.g. APP-202607-A1B2C3, generated at creation
+  // time (drafts included) so it can be referenced/searched immediately.
+  applicationNumber String            @unique
+
+  applicantId       String
+  applicant         User              @relation("ApplicantApplications", fields: [applicantId], references: [id])
+
+  applicationTypeId String
+  applicationType   ApplicationType   @relation(fields: [applicationTypeId], references: [id])
+
+  // Populated automatically by the routing engine when the application is
+  // submitted (copied from ApplicationType.departmentId at that time).
+  departmentId      String?
+  department        Department?       @relation(fields: [departmentId], references: [id])
+
+  // Populated automatically at submission from the applicant's chosen
+  // supervisor, only when the application type requires supervisor approval.
+  supervisorId      String?
+  supervisor        User?             @relation("SupervisorApplications", fields: [supervisorId], references: [id])
+
+  subject           String
+  description       String
+  priority          Priority          @default(MEDIUM)
+  status            ApplicationStatus @default(DRAFT)
+
+  // --- Phase 5/6: workflow position + deadline tracking ---
+
+  // Which stage of the approval hierarchy currently holds this application.
+  // Null while DRAFT and once a final decision (APPROVED/REJECTED) is made.
+  currentStage      WorkflowStage?
+
+  // Set when a reviewer explicitly forwards the application to a specific
+  // person (rather than "whoever's on duty" for the current stage/department).
+  // Cleared whenever the stage changes through normal approval or escalation.
+  assignedOfficerId String?
+  assignedOfficer   User?             @relation("AssignedOfficerApplications", fields: [assignedOfficerId], references: [id])
+
+  // How many times this application has been auto-escalated up the hierarchy.
+  escalationLevel   Int               @default(0)
+
+  // When the current stage's response window started/ends. lastActionAt
+  // resets every time the application enters a new stage (submit, approve,
+  // forward, escalate, or resume from AWAITING_INFO); deadlineAt is
+  // lastActionAt + the application type's SLA in *working* hours (see
+  // utils/workingHours.js). Both are null while DRAFT or AWAITING_INFO
+  // (the clock pauses while the ball is in the applicant's court) and once
+  // a final decision is made.
+  lastActionAt      DateTime?
+  deadlineAt        DateTime?
+
+  submittedAt       DateTime?
+  closedAt          DateTime?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  attachments       ApplicationAttachment[]
+  history           ApplicationHistory[]
+  comments          ApplicationComment[]
+  reminders         ApplicationReminder[]
+  escalations       EscalationRecord[]
+  notifications     Notification[]
+
+  @@index([applicantId])
+  @@index([supervisorId])
+  @@index([departmentId])
+  @@index([assignedOfficerId])
+  @@index([status])
+  @@index([currentStage])
+  @@index([deadlineAt])
+}
+
+model ApplicationAttachment {
+  id             String      @id @default(uuid())
+  applicationId  String
+  application    Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fileName       String
+  storedFileName String
+  filePath       String
+  mimeType       String
+  size           Int
+  uploadedAt     DateTime    @default(now())
+
+  @@index([applicationId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Intelligent Workflow & Routing Engine
+// ---------------------------------------------------------------------------
+
+// Full audit trail / activity timeline for an application: every workflow
+// action (submit, approve, reject, request/provide info, forward, escalate,
+// comment, reminder, close) gets one row here, in addition to whatever else
+// that action does (e.g. a comment also gets a row in ApplicationComment).
+model ApplicationHistory {
+  id            String            @id @default(uuid())
+  applicationId String
+  application   Application       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  // Null for system-generated entries (automatic escalation, reminders).
+  actorId       String?
+  actor         User?             @relation(fields: [actorId], references: [id])
+
+  action        WorkflowAction
+  fromStatus    ApplicationStatus?
+  toStatus      ApplicationStatus?
+  remarks       String?
+  createdAt     DateTime          @default(now())
+
+  @@index([applicationId])
+  @@index([action])
+}
+
+// The "Communication & Comment System" — messages between the applicant and
+// reviewers, permanently attached to the application record.
+model ApplicationComment {
+  id            String      @id @default(uuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  authorId      String
+  author        User        @relation(fields: [authorId], references: [id])
+  message       String
+  createdAt     DateTime    @default(now())
+
+  attachments   CommentAttachment[]
+
+  @@index([applicationId])
+}
+
+// Phase 7 — "Attachment sharing" in the comment thread. Mirrors
+// ApplicationAttachment but scoped to a single comment instead of the whole
+// application.
+model CommentAttachment {
+  id             String             @id @default(uuid())
+  commentId      String
+  comment        ApplicationComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  fileName       String
+  storedFileName String
+  filePath       String
+  mimeType       String
+  size           Int
+  uploadedAt     DateTime           @default(now())
+
+  @@index([commentId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Deadline, Reminder & Escalation Engine
+// ---------------------------------------------------------------------------
+
+// One row per reminder actually sent, keyed by how many *working* hours had
+// elapsed since the current stage started. Used by the reminder scheduler to
+// avoid re-sending the same threshold twice within the same stage window.
+model ApplicationReminder {
+  id            String          @id @default(uuid())
+  applicationId String
+  application   Application     @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  recipientId   String
+  recipient     User            @relation(fields: [recipientId], references: [id])
+  hoursElapsed  Int
+  channel       ReminderChannel @default(EMAIL)
+  sentAt        DateTime        @default(now())
+
+  @@index([applicationId])
+  @@index([applicationId, hoursElapsed])
+}
+
+// Permanent record of every automatic (or manually-triggered) escalation,
+// kept even after the application later moves on, for accountability.
+model EscalationRecord {
+  id            String        @id @default(uuid())
+  applicationId String
+  application   Application   @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  fromStage     WorkflowStage
+  toStage       WorkflowStage
+
+  fromUserId    String?
+  fromUser      User?         @relation("EscalationFrom", fields: [fromUserId], references: [id])
+  toUserId      String?
+  toUser        User?         @relation("EscalationTo", fields: [toUserId], references: [id])
+
+  reason        String
+  createdAt     DateTime      @default(now())
+
+  @@index([applicationId])
+}
+
+// Lightweight in-app notification feed ("Dashboard alerts" / "In-system
+// notifications") — created alongside every email the notification service
+// sends, so the dashboard doesn't depend on a mailbox to show updates.
+model Notification {
+  id            String       @id @default(uuid())
+  userId        String
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  applicationId String?
+  application   Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+
+  type          String
+  title         String
+  message       String
+  isRead        Boolean      @default(false)
+
+  // Phase 7: which channel(s) this particular notification actually went
+  // out on, e.g. a muted-email user might only ever see [IN_APP] here while
+  // someone with everything enabled sees [IN_APP, EMAIL, SMS]. Drives the
+  // "delivered via" indicator in the notification center.
+  channels      NotificationChannel[] @default([IN_APP])
+
+  createdAt     DateTime     @default(now())
+
+  @@index([userId])
+  @@index([userId, isRead])
+  @@index([applicationId])
+}
+
+// Phase 7 — per-user opt-in/out for how notifications are delivered. One row
+// per user, created lazily with sensible defaults the first time it's read
+// or written (see notification.service.js#getOrCreatePreferences), so a
+// fresh account doesn't need a seed step. `mutedTypes` silences one
+// notification `type` (e.g. "COMMENT", "REMINDER" — the same free-form
+// strings already used on Notification.type) across every channel, without
+// the user having to give up notifications entirely.
+model NotificationPreference {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  emailEnabled Boolean @default(true)
+  inAppEnabled Boolean @default(true)
+  smsEnabled   Boolean @default(false)
+
+  mutedTypes   String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Administrator Portal
+// ---------------------------------------------------------------------------
+
+// Holiday Calendar's inverse case: a specific Saturday that should count as
+// a working day (e.g. a make-up day for a mid-week holiday). isWorkingDay()
+// in utils/workingHours.js checks this before applying the default
+// "Saturdays are never working days" rule.
+model WorkingSaturday {
+  id        String   @id @default(uuid())
+  date      DateTime
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([date])
+}
+
+// Append-only system activity log — login history, user/department/settings
+// changes, and anything else that isn't already captured by
+// ApplicationHistory (which covers submission/approval/rejection/comments/
+// escalations for individual applications). The Audit Logs page in the
+// Administrator Portal reads both streams together.
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  actorEmail String? // preserved even if the actor is later deleted, or for failed-login attempts with no matching user
+  category   String // AUTH, USER, DEPARTMENT, APPLICATION_TYPE, ROUTING_RULE, HOLIDAY, SETTINGS
+  action     String // e.g. LOGIN_SUCCESS, LOGIN_FAILED, USER_CREATED, USER_ROLE_CHANGED, DEPARTMENT_DELETED
+  targetType String?
+  targetId   String?
+  details    String?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([category])
+  @@index([actorId])
+  @@index([createdAt])
+}
+
+// Single-row admin-editable configuration store (System Settings). Kept as
+// one JSON blob rather than a key/value table since the whole settings
+// panel is read and saved together, and the set of fields is fixed and
+// small enough not to need per-key querying.
+model SystemSetting {
+  id                        Int      @id @default(1)
+  reminderThresholdHours    Int[]    @default([24, 48, 60])
+  finalWarningMarginHours   Int      @default(6)
+  workingDayStartHour       Int      @default(9)
+  workingDayEndHour         Int      @default(17)
+  maxUploadSizeMb           Int      @default(10)
+  universityName            String   @default("")
+  universityContactEmail    String   @default("")
+  supportPhone              String   @default("")
+  passwordMinLength         Int      @default(8)
+  sessionTimeoutMinutes     Int      @default(60)
+  backupFrequency           String   @default("DAILY")
+  backupRetentionDays       Int      @default(30)
+  updatedById               String?
+  updatedAt                 DateTime @updatedAt
+}
